@@ -1,0 +1,10 @@
+#V2
+\\q
+CREATE EXTERNAL TABLE model_calls\nSTORED AS PARQUET\nLOCATION 'gs://fusionfire-bucket-02a411c/14f479e7-9028-492f-92c3-4cd999920a05/model_calls/project_id=3d346743-bd33-4348-8a9b-203ee89950b8/day=2026-03-17/';
+EXPLAIN ANALYZE\nSELECT\n    trace_id,\n    model,\n    system,\n    COALESCE(SUM(input_tokens), 0) as input_tokens,\n    COALESCE(SUM(output_tokens), 0) as output_tokens\nFROM model_calls\nGROUP BY trace_id, model, system;
+\\q
+CREATE EXTERNAL TABLE model_calls\nSTORED AS PARQUET\nLOCATION 'gs://fusionfire-bucket-02a411c/14f479e7-9028-492f-92c3-4cd999920a05/model_calls/project_id=3d346743-bd33-4348-8a9b-203ee89950b8/day=2026-03-17/019d1c8a-d2ac-7580-b7aa-33ddda459cf4_00001.parquet';
+EXPLAIN ANALYZE\nSELECT\n    trace_id,\n    model,\n    system,\n    COALESCE(SUM(input_tokens), 0) as input_tokens,\n    COALESCE(SUM(output_tokens), 0) as output_tokens\nFROM model_calls\nGROUP BY trace_id, model, system;
+CREATE EXTERNAL TABLE model_calls\nSTORED AS PARQUET\nLOCATION 'gs://fusionfire-bucket-02a411c/14f479e7-9028-492f-92c3-4cd999920a05/model_calls/project_id=3d346743-bd33-4348-8a9b-203ee89950b8/day=2026-03-17/test.parquet';
+EXPLAIN ANALYZE\nSELECT\n    trace_id,\n    model,\n    system,\n    COALESCE(SUM(input_tokens), 0) as input_tokens,\n    COALESCE(SUM(output_tokens), 0) as output_tokens\nFROM model_calls\nGROUP BY trace_id, model, system;
+\\q
