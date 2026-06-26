@@ -71,9 +71,9 @@ fn unnest_json_calls(func: &ScalarFunction) -> Option<Transformed<Expr>> {
     let first_arg = outer_args_iter.next()?;
     let inner_func = extract_scalar_function(first_arg)?;
 
-    // both json_get and json_as_text would produce new JSON to be processed by the outer
-    // function so can be inlined
-    if !matches!(inner_func.func.name(), "json_get" | "json_as_text") {
+    // only json_get preserves a JSON value for the outer function. json_as_text returns SQL text,
+    // so flattening through it changes semantics for JSON strings that contain JSON.
+    if inner_func.func.name() != "json_get" {
         return None;
     }
 
