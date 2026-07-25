@@ -8,10 +8,12 @@ license = "Apache-2.0"
 keywords = ["datafusion", "JSON", "SQL"]
 categories = ["database-implementations", "parsing"]
 repository = "https://github.com/datafusion-contrib/datafusion-functions-json/"
-rust-version = "1.88.0"
+# TEMPORARY: raised from 1.88.0 to match the MSRV of `apache/datafusion` main
+rust-version = "1.94.0"
 
 [dependencies]
-datafusion = { version = "54", default-features = false, features = [
+# TEMPORARY: track unreleased DataFusion, see the note at the bottom of this file
+datafusion = { git = "https://github.com/apache/datafusion.git", branch = "main", default-features = false, features = [
     "sql",
 ] }
 jiter = "0.15.0"
@@ -21,7 +23,8 @@ serde_json = "1"
 
 [dev-dependencies]
 codspeed-criterion-compat = "2.6"
-datafusion = { version = "54", default-features = false, features = [
+# TEMPORARY: track unreleased DataFusion, see the note at the bottom of this file
+datafusion = { git = "https://github.com/apache/datafusion.git", branch = "main", default-features = false, features = [
     "nested_expressions",
     "sql",
 ] }
@@ -39,12 +42,15 @@ pedantic = { level = "deny", priority = -1 }
 name = "main"
 harness = false
 
-# [patch.crates-io]
-# datafusion = { git = "https://github.com/apache/datafusion.git", rev = "d47bd599ee911eb4be018595b860341ff437ccb1" }
-# datafusion-common = { git = "https://github.com/apache/datafusion.git", rev = "d47bd599ee911eb4be018595b860341ff437ccb1" }
-# datafusion-expr = { git = "https://github.com/apache/datafusion.git", rev = "d47bd599ee911eb4be018595b860341ff437ccb1" }
-# datafusion-execution = { git = "https://github.com/apache/datafusion.git", rev = "d47bd599ee911eb4be018595b860341ff437ccb1" }
-# datafusion-sql = { git = "https://github.com/apache/datafusion.git", rev = "d47bd599ee911eb4be018595b860341ff437ccb1" }
-# datafusion-proto = { git = "https://github.com/apache/datafusion.git", rev = "d47bd599ee911eb4be018595b860341ff437ccb1" }
-# datafusion-datasource = { git = "https://github.com/apache/datafusion.git", rev = "d47bd599ee911eb4be018595b860341ff437ccb1" }
-# datafusion-physical-expr-adapter = { git = "https://github.com/apache/datafusion.git", rev = "d47bd599ee911eb4be018595b860341ff437ccb1" }
+# TEMPORARY — do not release from this branch.
+#
+# The `datafusion` dependencies above point at `apache/datafusion` main rather than a published
+# version, so breakage from unreleased DataFusion changes shows up here instead of during the
+# upgrade after a release. `cargo publish` rejects git dependencies, so this branch cannot be
+# released as-is: when the next DataFusion is out, swap both entries back to
+# `{ version = "<next>", default-features = false, features = [...] }` and restore `rust-version`.
+#
+# A `[patch.crates-io]` entry (as previously stubbed out here) is deliberately not used: a patch
+# only applies while the git version still satisfies the `version = "..."` requirement, so the
+# moment main bumps its major the patch would be silently dropped and CI would go back to testing
+# the released version.
