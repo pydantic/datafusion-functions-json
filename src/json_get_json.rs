@@ -1,12 +1,15 @@
-use std::any::Any;
+use std::sync::Arc;
 
 use datafusion::arrow::array::StringArray;
-use datafusion::arrow::datatypes::DataType;
+use datafusion::arrow::datatypes::{DataType, Field, FieldRef};
 use datafusion::common::Result as DataFusionResult;
-use datafusion::logical_expr::{ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility};
+use datafusion::logical_expr::{
+    ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility,
+};
 
 use crate::common::{get_err, invoke, jiter_json_find, return_type_check, GetError, JsonPath};
 use crate::common_macros::make_udf_function;
+use crate::common_union::json_field_metadata;
 
 make_udf_function!(
     JsonGetJson,
@@ -31,10 +34,6 @@ impl Default for JsonGetJson {
 }
 
 impl ScalarUDFImpl for JsonGetJson {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         self.aliases[0].as_str()
     }
@@ -47,12 +46,38 @@ impl ScalarUDFImpl for JsonGetJson {
         return_type_check(arg_types, self.name(), DataType::Utf8)
     }
 
+    fn return_field_from_args(&self, args: ReturnFieldArgs) -> DataFusionResult<FieldRef> {
+        let arg_types: Vec<DataType> = args.arg_fields.iter().map(|f| f.data_type().clone()).collect();
+        let return_type = self.return_type(&arg_types)?;
+        Ok(Arc::new(
+            Field::new(self.name(), return_type, true).with_metadata(json_field_metadata()),
+        ))
+    }
+
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DataFusionResult<ColumnarValue> {
         invoke::<StringArray>(&args.args, jiter_json_get_json)
     }
 
     fn aliases(&self) -> &[String] {
         &self.aliases
+    }
+
+    fn placement(
+        &self,
+        args: &[datafusion::logical_expr::ExpressionPlacement],
+    ) -> datafusion::logical_expr::ExpressionPlacement {
+        // If the first argument is a column and the remaining arguments are literals (a path)
+        // then we can push this UDF down to the leaf nodes.
+        if args.len() >= 2
+            && matches!(args[0], datafusion::logical_expr::ExpressionPlacement::Column)
+            && args[1..]
+                .iter()
+                .all(|arg| matches!(arg, datafusion::logical_expr::ExpressionPlacement::Literal))
+        {
+            datafusion::logical_expr::ExpressionPlacement::MoveTowardsLeafNodes
+        } else {
+            datafusion::logical_expr::ExpressionPlacement::KeepInPlace
+        }
     }
 }
 

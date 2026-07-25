@@ -1,5 +1,3 @@
-use std::any::Any;
-
 use datafusion::arrow::array::StringArray;
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::Result as DataFusionResult;
@@ -32,10 +30,6 @@ impl Default for JsonGetStr {
 }
 
 impl ScalarUDFImpl for JsonGetStr {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         self.aliases[0].as_str()
     }
@@ -54,6 +48,24 @@ impl ScalarUDFImpl for JsonGetStr {
 
     fn aliases(&self) -> &[String] {
         &self.aliases
+    }
+
+    fn placement(
+        &self,
+        args: &[datafusion::logical_expr::ExpressionPlacement],
+    ) -> datafusion::logical_expr::ExpressionPlacement {
+        // If the first argument is a column and the remaining arguments are literals (a path)
+        // then we can push this UDF down to the leaf nodes.
+        if args.len() >= 2
+            && matches!(args[0], datafusion::logical_expr::ExpressionPlacement::Column)
+            && args[1..]
+                .iter()
+                .all(|arg| matches!(arg, datafusion::logical_expr::ExpressionPlacement::Literal))
+        {
+            datafusion::logical_expr::ExpressionPlacement::MoveTowardsLeafNodes
+        } else {
+            datafusion::logical_expr::ExpressionPlacement::KeepInPlace
+        }
     }
 }
 

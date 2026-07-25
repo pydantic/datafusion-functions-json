@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{ArrayRef, Int64Array, Int64Builder};
@@ -33,10 +32,6 @@ impl Default for JsonGetInt {
 }
 
 impl ScalarUDFImpl for JsonGetInt {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         self.aliases[0].as_str()
     }
@@ -55,6 +50,24 @@ impl ScalarUDFImpl for JsonGetInt {
 
     fn aliases(&self) -> &[String] {
         &self.aliases
+    }
+
+    fn placement(
+        &self,
+        args: &[datafusion::logical_expr::ExpressionPlacement],
+    ) -> datafusion::logical_expr::ExpressionPlacement {
+        // If the first argument is a column and the remaining arguments are literals (a path)
+        // then we can push this UDF down to the leaf nodes.
+        if args.len() >= 2
+            && matches!(args[0], datafusion::logical_expr::ExpressionPlacement::Column)
+            && args[1..]
+                .iter()
+                .all(|arg| matches!(arg, datafusion::logical_expr::ExpressionPlacement::Literal))
+        {
+            datafusion::logical_expr::ExpressionPlacement::MoveTowardsLeafNodes
+        } else {
+            datafusion::logical_expr::ExpressionPlacement::KeepInPlace
+        }
     }
 }
 
@@ -86,19 +99,23 @@ impl InvokeResult for Int64Array {
 fn jiter_json_get_int(json_data: Option<&str>, path: &[JsonPath]) -> Result<i64, GetError> {
     if let Some((mut jiter, peek)) = jiter_json_find(json_data, path) {
         match peek {
-            // numbers are represented by everything else in peek, hence doing it this way
+            Peek::String => {
+                let s = jiter.known_str()?;
+                s.parse::<i64>().map_err(|_| GetError)
+            }
             Peek::Null
             | Peek::True
             | Peek::False
             | Peek::Minus
             | Peek::Infinity
             | Peek::NaN
-            | Peek::String
             | Peek::Array
             | Peek::Object => get_err!(),
             _ => match jiter.known_int(peek)? {
                 NumberInt::Int(i) => Ok(i),
-                NumberInt::BigInt(_) => get_err!(),
+                // jiter returns `BigInt` for any integer its fast path couldn't decode, which
+                // includes values that do fit in `i64`, hence the conversion attempt
+                NumberInt::BigInt(b) => i64::try_from(b).map_err(|_| GetError),
             },
         }
     } else {

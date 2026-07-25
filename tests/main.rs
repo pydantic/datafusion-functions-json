@@ -9,6 +9,7 @@ use datafusion::common::ScalarValue;
 use datafusion::config::ConfigOptions;
 use datafusion::logical_expr::{ColumnarValue, ScalarFunctionArgs};
 use datafusion::prelude::SessionContext;
+use datafusion_functions_json::json_field_metadata;
 use datafusion_functions_json::udfs::json_get_str_udf;
 use utils::{create_context, display_val, logical_plan, run_query, run_query_params};
 
@@ -162,6 +163,36 @@ async fn test_json_get_array_with_path() {
 }
 
 #[tokio::test]
+async fn test_json_get_array_inner_field_json_metadata() {
+    let sql = r#"select json_get_array('[{"a": 1}, {"b": 2}]') as v"#;
+    let batches = run_query(sql).await.unwrap();
+    let schema = batches[0].schema();
+    let field = schema.field(0);
+    let DataType::List(inner_field) = field.data_type() else {
+        panic!("expected List, got {:?}", field.data_type());
+    };
+    assert_json_field_metadata(inner_field.metadata());
+
+    let array_field = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::ListArray>()
+        .unwrap();
+    let DataType::List(produced_inner) = array_field.data_type() else {
+        panic!("expected List in produced array");
+    };
+    assert_json_field_metadata(produced_inner.metadata());
+}
+
+fn assert_json_field_metadata(metadata: &HashMap<String, String>) {
+    assert_eq!(
+        metadata.get("ARROW:extension:name").map(String::as_str),
+        Some("arrow.json")
+    );
+    assert_eq!(metadata.get("ARROW:extension:metadata").map(String::as_str), Some("{}"));
+}
+
+#[tokio::test]
 async fn test_json_get_equals() {
     let e = run_query(r"select name, json_get(json_data, 'foo')='abc' from test")
         .await
@@ -282,6 +313,167 @@ async fn test_json_get_no_path() {
 async fn test_json_get_int() {
     let batches = run_query(r"select json_get_int('[1, 2, 3]', 1)").await.unwrap();
     assert_eq!(display_val(batches).await, (DataType::Int64, "2".to_string()));
+}
+
+#[tokio::test]
+async fn test_json_get_int_string_parse() {
+    // string containing int
+    let batches = run_query(r#"select json_get_int('{"foo": "123"}', 'foo')"#)
+        .await
+        .unwrap();
+    assert_eq!(display_val(batches).await, (DataType::Int64, "123".to_string()));
+
+    // negative string
+    let batches = run_query(r#"select json_get_int('{"foo": "-42"}', 'foo')"#)
+        .await
+        .unwrap();
+    assert_eq!(display_val(batches).await, (DataType::Int64, "-42".to_string()));
+
+    // non-numeric string returns null
+    let batches = run_query(r#"select json_get_int('{"foo": "abc"}', 'foo')"#)
+        .await
+        .unwrap();
+    assert_eq!(display_val(batches).await, (DataType::Int64, String::new()));
+
+    // float string returns null (not a valid int)
+    let batches = run_query(r#"select json_get_int('{"foo": "1.5"}', 'foo')"#)
+        .await
+        .unwrap();
+    assert_eq!(display_val(batches).await, (DataType::Int64, String::new()));
+}
+
+#[tokio::test]
+async fn test_json_get_large_int() {
+    // jiter returns these as `BigInt` even though they fit in i64, they must not be lost
+    let sql = r#"select json_get('{"foo": 1753200000000000000}', 'foo')"#;
+    let batches = run_query(sql).await.unwrap();
+    let (value_type, value_repr) = display_val(batches).await;
+    assert!(matches!(value_type, DataType::Union(_, _)));
+    assert_eq!(value_repr, "{int=1753200000000000000}");
+
+    // the i64 bounds themselves
+    let sql = r#"select json_get('{"foo": 9223372036854775807}', 'foo')"#;
+    let batches = run_query(sql).await.unwrap();
+    assert_eq!(display_val(batches).await.1, "{int=9223372036854775807}");
+
+    let sql = r#"select json_get('{"foo": -9223372036854775808}', 'foo')"#;
+    let batches = run_query(sql).await.unwrap();
+    assert_eq!(display_val(batches).await.1, "{int=-9223372036854775808}");
+
+    let sql = r#"select json_get_int('{"foo": 9223372036854775807}', 'foo')"#;
+    let batches = run_query(sql).await.unwrap();
+    assert_eq!(
+        display_val(batches).await,
+        (DataType::Int64, "9223372036854775807".to_string())
+    );
+}
+
+#[tokio::test]
+async fn test_json_get_out_of_range_int() {
+    // integers outside i64 range have no representation in the JSON union, they're returned as
+    // null rather than panicking (or silently losing precision as a float)
+    let sql = r#"select json_get('{"foo": 18446744073709551615}', 'foo')"#;
+    let batches = run_query(sql).await.unwrap();
+    let (value_type, value_repr) = display_val(batches).await;
+    assert!(matches!(value_type, DataType::Union(_, _)));
+    assert_eq!(value_repr, "{null=}");
+
+    // below i64::MIN
+    let sql = r#"select json_get('{"foo": -9223372036854775809}', 'foo')"#;
+    let batches = run_query(sql).await.unwrap();
+    assert_eq!(display_val(batches).await.1, "{null=}");
+
+    // casts of the null union stay null rather than erroring
+    let sql = r#"select json_get('{"foo": 18446744073709551615}', 'foo')::int"#;
+    let batches = run_query(sql).await.unwrap();
+    assert_eq!(display_val(batches).await, (DataType::Int64, String::new()));
+
+    let sql = r#"select json_get('{"foo": 18446744073709551615}', 'foo')::string"#;
+    let batches = run_query(sql).await.unwrap();
+    assert_eq!(display_val(batches).await, (DataType::Utf8, String::new()));
+}
+
+#[tokio::test]
+async fn test_json_get_out_of_range_int_neighbours() {
+    // an out-of-range int must only null out its own row, not poison the rest of the batch
+    let sql = "select json_get(v, 0) from (values ('[1]'), ('[18446744073709551615]'), ('[3]')) t(v)";
+    let batches = run_query(sql).await.unwrap();
+    let expected = [
+        "+------------------------+",
+        "| json_get(t.v,Int64(0)) |",
+        "+------------------------+",
+        "| {int=1}                |",
+        "| {null=}                |",
+        "| {int=3}                |",
+        "+------------------------+",
+    ];
+    assert_batches_eq!(expected, &batches);
+}
+
+#[tokio::test]
+async fn test_json_get_out_of_range_int_typed() {
+    // json_get_int can't represent it either
+    let sql = r#"select json_get_int('{"foo": 18446744073709551615}', 'foo')"#;
+    let batches = run_query(sql).await.unwrap();
+    assert_eq!(display_val(batches).await, (DataType::Int64, String::new()));
+
+    // json_get_float is lossy but returns a value
+    let sql = r#"select json_get_float('{"foo": 18446744073709551615}', 'foo')"#;
+    let batches = run_query(sql).await.unwrap();
+    assert_eq!(
+        display_val(batches).await,
+        (DataType::Float64, "1.8446744073709552e19".to_string())
+    );
+
+    // json_as_text reads the raw slice, so it stays exact
+    let sql = r#"select json_as_text('{"foo": 18446744073709551615}', 'foo')"#;
+    let batches = run_query(sql).await.unwrap();
+    assert_eq!(
+        display_val(batches).await,
+        (DataType::Utf8, "18446744073709551615".to_string())
+    );
+}
+
+#[tokio::test]
+async fn test_json_get_float_string_parse() {
+    // string containing float
+    let batches = run_query(r#"select json_get_float('{"foo": "1.5"}', 'foo')"#)
+        .await
+        .unwrap();
+    assert_eq!(display_val(batches).await, (DataType::Float64, "1.5".to_string()));
+
+    // string containing int parses as float
+    let batches = run_query(r#"select json_get_float('{"foo": "42"}', 'foo')"#)
+        .await
+        .unwrap();
+    assert_eq!(display_val(batches).await, (DataType::Float64, "42.0".to_string()));
+
+    // non-numeric string returns null
+    let batches = run_query(r#"select json_get_float('{"foo": "abc"}', 'foo')"#)
+        .await
+        .unwrap();
+    assert_eq!(display_val(batches).await, (DataType::Float64, String::new()));
+}
+
+#[tokio::test]
+async fn test_json_get_bool_string_parse() {
+    // string "true"
+    let batches = run_query(r#"select json_get_bool('{"foo": "true"}', 'foo')"#)
+        .await
+        .unwrap();
+    assert_eq!(display_val(batches).await, (DataType::Boolean, "true".to_string()));
+
+    // string "false"
+    let batches = run_query(r#"select json_get_bool('{"foo": "false"}', 'foo')"#)
+        .await
+        .unwrap();
+    assert_eq!(display_val(batches).await, (DataType::Boolean, "false".to_string()));
+
+    // non-bool string returns null
+    let batches = run_query(r#"select json_get_bool('{"foo": "abc"}', 'foo')"#)
+        .await
+        .unwrap();
+    assert_eq!(display_val(batches).await, (DataType::Boolean, String::new()));
 }
 
 #[tokio::test]
@@ -409,6 +601,15 @@ async fn test_json_get_json_float() {
     let sql = r#"select json_get_json('{"x": 4.2e-1}', 'x')"#;
     let batches = run_query(sql).await.unwrap();
     assert_eq!(display_val(batches).await, (DataType::Utf8, "4.2e-1".to_string()));
+}
+
+#[tokio::test]
+async fn test_json_get_json_json_metadata() {
+    let sql = r#"select json_get_json('{"x": [1, 2]}', 'x') as v"#;
+    let batches = run_query(sql).await.unwrap();
+    let schema = batches[0].schema();
+    let field = schema.field(0);
+    assert_json_field_metadata(field.metadata());
 }
 
 #[tokio::test]
@@ -597,10 +798,7 @@ fn test_json_get_utf8() {
                 Arc::new(Field::new("arg_3", DataType::LargeUtf8, false)),
             ],
             number_rows: 1,
-            return_field: Arc::new(
-                Field::new("ret_field", DataType::Utf8, false)
-                    .with_metadata(HashMap::from_iter(vec![("is_json".to_string(), "true".to_string())])),
-            ),
+            return_field: Arc::new(Field::new("ret_field", DataType::Utf8, false).with_metadata(json_field_metadata())),
             config_options: Arc::new(ConfigOptions::default()),
         })
         .unwrap()
@@ -631,10 +829,7 @@ fn test_json_get_large_utf8() {
                 Arc::new(Field::new("arg_3", DataType::LargeUtf8, false)),
             ],
             number_rows: 1,
-            return_field: Arc::new(
-                Field::new("ret_field", DataType::Utf8, false)
-                    .with_metadata(HashMap::from_iter(vec![("is_json".to_string(), "true".to_string())])),
-            ),
+            return_field: Arc::new(Field::new("ret_field", DataType::Utf8, false).with_metadata(json_field_metadata())),
             config_options: Arc::new(ConfigOptions::default()),
         })
         .unwrap()
@@ -643,6 +838,114 @@ fn test_json_get_large_utf8() {
     };
 
     assert_eq!(sv, ScalarValue::Utf8(Some("x".to_string())));
+}
+
+/// A `NullArray` input (Arrow `DataType::Null`, as opposed to a string array containing null
+/// values) must yield an all-null result rather than erroring with "unexpected json array type
+/// Null". This mirrors the runtime condition where a column declared as a string type
+/// materialises as a `NullArray` for a given batch.
+#[test]
+fn test_json_as_text_null_array_scalar_path() {
+    use datafusion::arrow::array::NullArray;
+    use datafusion_functions_json::udfs::json_as_text_udf;
+
+    let udf = json_as_text_udf();
+    let attributes: ArrayRef = Arc::new(NullArray::new(3)); // DataType::Null
+
+    let ColumnarValue::Array(result) = udf
+        .invoke_with_args(ScalarFunctionArgs {
+            args: vec![
+                ColumnarValue::Array(attributes),
+                ColumnarValue::Scalar(ScalarValue::Utf8(Some("client_name".into()))),
+            ],
+            arg_fields: vec![
+                Arc::new(Field::new("attributes", DataType::Null, true)),
+                Arc::new(Field::new("path", DataType::Utf8, true)),
+            ],
+            number_rows: 3,
+            return_field: Arc::new(Field::new("result", DataType::Utf8, true)),
+            config_options: Arc::new(ConfigOptions::default()),
+        })
+        .unwrap()
+    else {
+        panic!("expected array")
+    };
+
+    assert_eq!(result.len(), 3);
+    assert_eq!(result.null_count(), 3);
+    assert_eq!(result.data_type(), &DataType::Utf8);
+}
+
+/// As above but exercising the array/array-path kernel (`invoke_array_array`): both the JSON
+/// argument and the path argument are arrays, with the JSON argument being a `NullArray`.
+#[test]
+fn test_json_get_int_null_array_array_path() {
+    use datafusion::arrow::array::{Int64Array, NullArray, StringArray};
+    use datafusion_functions_json::udfs::json_get_int_udf;
+
+    let udf = json_get_int_udf();
+    let attributes: ArrayRef = Arc::new(NullArray::new(2)); // DataType::Null
+    let paths: ArrayRef = Arc::new(StringArray::from(vec!["a", "b"]));
+
+    let ColumnarValue::Array(result) = udf
+        .invoke_with_args(ScalarFunctionArgs {
+            args: vec![ColumnarValue::Array(attributes), ColumnarValue::Array(paths)],
+            arg_fields: vec![
+                Arc::new(Field::new("attributes", DataType::Null, true)),
+                Arc::new(Field::new("path", DataType::Utf8, true)),
+            ],
+            number_rows: 2,
+            return_field: Arc::new(Field::new("result", DataType::Int64, true)),
+            config_options: Arc::new(ConfigOptions::default()),
+        })
+        .unwrap()
+    else {
+        panic!("expected array")
+    };
+
+    assert_eq!(result.len(), 2);
+    assert_eq!(result.null_count(), 2);
+    assert_eq!(result.as_any().downcast_ref::<Int64Array>().unwrap().len(), 2);
+}
+
+/// `json_get` returns the JSON union type; a `NullArray` input must round-trip to an all-null
+/// union result.
+#[test]
+fn test_json_get_null_array_union_return() {
+    use datafusion::arrow::array::{NullArray, UnionArray};
+    use datafusion_functions_json::udfs::json_get_udf;
+
+    let udf = json_get_udf();
+    let attributes: ArrayRef = Arc::new(NullArray::new(4)); // DataType::Null
+
+    // json_get returns the JSON union type; derive it from the udf rather than hard-coding it.
+    // The declared (plan-time) type is a string even though the runtime array is a NullArray.
+    let return_type = udf.return_type(&[DataType::Utf8, DataType::Utf8]).unwrap();
+
+    let ColumnarValue::Array(result) = udf
+        .invoke_with_args(ScalarFunctionArgs {
+            args: vec![
+                ColumnarValue::Array(attributes),
+                ColumnarValue::Scalar(ScalarValue::Utf8(Some("a".into()))),
+            ],
+            arg_fields: vec![
+                Arc::new(Field::new("attributes", DataType::Null, true)),
+                Arc::new(Field::new("path", DataType::Utf8, true)),
+            ],
+            number_rows: 4,
+            return_field: Arc::new(Field::new("result", return_type, true).with_metadata(json_field_metadata())),
+            config_options: Arc::new(ConfigOptions::default()),
+        })
+        .unwrap()
+    else {
+        panic!("expected array")
+    };
+
+    // A union array encodes nulls via the "null" union member (type id 0), not a null buffer,
+    // so check that every row points at the null member rather than relying on null_count().
+    assert_eq!(result.len(), 4);
+    let union = result.as_any().downcast_ref::<UnionArray>().unwrap();
+    assert!(union.type_ids().iter().all(|&id| id == 0), "expected all-null union");
 }
 
 #[tokio::test]
@@ -661,6 +964,22 @@ async fn test_json_get_union_scalar() {
         assert_batches_eq!(expected, &batches);
     })
     .await;
+}
+
+#[tokio::test]
+async fn test_json_as_text_nested_json_string() {
+    let sql = r#"select json_as_text(json_as_text('{"user_id":"{\"device_id\":\"abc\"}"}', 'user_id'), 'device_id')"#;
+    let batches = run_query(sql).await.unwrap();
+
+    assert_eq!(display_val(batches).await, (DataType::Utf8, "abc".to_string()));
+}
+
+#[tokio::test]
+async fn test_json_get_str_nested_json_string() {
+    let sql = r#"select json_get_str(json_as_text('{"user_id":"{\"device_id\":\"abc\"}"}', 'user_id'), 'device_id')"#;
+    let batches = run_query(sql).await.unwrap();
+
+    assert_eq!(display_val(batches).await, (DataType::Utf8, "abc".to_string()));
 }
 
 #[tokio::test]
@@ -762,9 +1081,9 @@ async fn test_plan_json_get_cte() {
         select name, json_get(j, 0) v from t
     ";
     let expected = [
-        "Projection: t.name, json_get(t.j, Int64(0)) AS v",
+        "Projection: t.name, __datafusion_extracted_1 AS v",
         "  SubqueryAlias: t",
-        "    Projection: test.name, json_get(test.json_data, Utf8(\"foo\")) AS j",
+        "    Projection: test.name, json_get(json_get(test.json_data, Utf8(\"foo\")), Int64(0)) AS __datafusion_extracted_1",
         "      TableScan: test projection=[name, json_data]",
     ];
 
@@ -1182,7 +1501,7 @@ async fn test_plan_double_arrow_double_nested() {
     let lines = logical_plan(r"explain select json_data->>'foo'->>0 from test").await;
 
     let expected = [
-        "Projection: json_as_text(test.json_data, Utf8(\"foo\"), Int64(0)) AS json_data ->> 'foo' ->> 0",
+        "Projection: json_as_text(json_as_text(test.json_data, Utf8(\"foo\")), Int64(0)) AS json_data ->> 'foo' ->> 0",
         "  TableScan: test projection=[json_data]",
     ];
 
@@ -1255,7 +1574,7 @@ async fn test_plan_double_arrow_double_nested_cast() {
 
     // NB: json_as_text(..)::int is NOT the same as `json_get_int(..)`, hence the cast is not rewritten
     let expected = [
-        "Projection: CAST(json_as_text(test.json_data, Utf8(\"foo\"), Int64(0)) AS json_data ->> 'foo' ->> 0 AS Int32)",
+        "Projection: CAST(json_as_text(json_as_text(test.json_data, Utf8(\"foo\")), Int64(0)) AS Int32) AS json_data ->> 'foo' ->> 0",
         "  TableScan: test projection=[json_data]",
     ];
 
@@ -2676,4 +2995,76 @@ async fn test_json_from_scalar_null_column() {
         "+----------------------------+",
     ];
     assert_batches_eq!(expected, &batches);
+}
+
+#[tokio::test]
+async fn test_json_union_to_text() {
+    // Flatten the heterogeneous union from `json_get` to JSON text, exercising the
+    // str / array (list member) / object / null arms in a single batch.
+    let batches = run_query("select name, json_union_to_text(json_get(json_data, 'foo')) as foo from test")
+        .await
+        .unwrap();
+
+    let expected = [
+        "+------------------+-------+",
+        "| name             | foo   |",
+        "+------------------+-------+",
+        "| object_foo       | \"abc\" |",
+        "| object_foo_array | [1]   |",
+        "| object_foo_obj   | {}    |",
+        "| object_foo_null  |       |",
+        "| object_bar       |       |",
+        "| list_foo         |       |",
+        "| invalid_json     |       |",
+        "+------------------+-------+",
+    ];
+    assert_batches_eq!(expected, &batches);
+
+    // The output column is tagged with the canonical Arrow JSON extension type.
+    let field = batches[0].schema().field_with_name("foo").unwrap().clone();
+    assert_eq!(field.data_type(), &DataType::Utf8View);
+    assert_eq!(
+        field.metadata().get("ARROW:extension:name").map(String::as_str),
+        Some("arrow.json")
+    );
+    assert_eq!(field.metadata(), &json_field_metadata());
+}
+
+#[tokio::test]
+async fn test_json_union_to_text_arms() {
+    // array and object arms already hold raw JSON text and pass through verbatim,
+    // including nested structures.
+    let (dt, repr) = display_val(
+        run_query(r#"select json_union_to_text(json_get('{"a": [1, {"b": 2}]}', 'a'))"#)
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(dt, DataType::Utf8View);
+    assert_eq!(repr, r#"[1, {"b": 2}]"#);
+
+    // string scalars are JSON-quoted and escaped (here: embedded quote + newline)
+    let (_, repr) = display_val(
+        run_query(r#"select json_union_to_text(json_get('{"s": "a\"b\n"}', 's'))"#)
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(repr, r#""a\"b\n""#);
+
+    // numbers and booleans render as bare JSON literals
+    let (_, repr) = display_val(
+        run_query(r#"select json_union_to_text(json_get('{"n": 42}', 'n'))"#)
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(repr, "42");
+    let (_, repr) = display_val(
+        run_query(r#"select json_union_to_text(json_get('{"b": true}', 'b'))"#)
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(repr, "true");
 }

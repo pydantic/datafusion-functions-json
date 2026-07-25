@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{ArrayRef, Float64Array, Float64Builder};
@@ -33,10 +32,6 @@ impl Default for JsonGetFloat {
 }
 
 impl ScalarUDFImpl for JsonGetFloat {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         self.aliases[0].as_str()
     }
@@ -55,6 +50,24 @@ impl ScalarUDFImpl for JsonGetFloat {
 
     fn aliases(&self) -> &[String] {
         &self.aliases
+    }
+
+    fn placement(
+        &self,
+        args: &[datafusion::logical_expr::ExpressionPlacement],
+    ) -> datafusion::logical_expr::ExpressionPlacement {
+        // If the first argument is a column and the remaining arguments are literals (a path)
+        // then we can push this UDF down to the leaf nodes.
+        if args.len() >= 2
+            && matches!(args[0], datafusion::logical_expr::ExpressionPlacement::Column)
+            && args[1..]
+                .iter()
+                .all(|arg| matches!(arg, datafusion::logical_expr::ExpressionPlacement::Literal))
+        {
+            datafusion::logical_expr::ExpressionPlacement::MoveTowardsLeafNodes
+        } else {
+            datafusion::logical_expr::ExpressionPlacement::KeepInPlace
+        }
     }
 }
 
@@ -86,6 +99,10 @@ impl InvokeResult for Float64Array {
 fn jiter_json_get_float(json_data: Option<&str>, path: &[JsonPath]) -> Result<f64, GetError> {
     if let Some((mut jiter, peek)) = jiter_json_find(json_data, path) {
         match peek {
+            Peek::String => {
+                let s = jiter.known_str()?;
+                s.parse::<f64>().map_err(|_| GetError)
+            }
             // numbers are represented by everything else in peek, hence doing it this way
             Peek::Null
             | Peek::True
@@ -93,7 +110,6 @@ fn jiter_json_get_float(json_data: Option<&str>, path: &[JsonPath]) -> Result<f6
             | Peek::Minus
             | Peek::Infinity
             | Peek::NaN
-            | Peek::String
             | Peek::Array
             | Peek::Object => get_err!(),
             _ => match jiter.known_number(peek)? {
