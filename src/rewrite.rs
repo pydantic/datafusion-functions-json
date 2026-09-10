@@ -6,7 +6,7 @@ use datafusion::common::tree_node::Transformed;
 use datafusion::common::Column;
 use datafusion::common::DFSchema;
 use datafusion::common::Result;
-use datafusion::logical_expr::expr::{Alias, Cast, Expr, ScalarFunction};
+use datafusion::logical_expr::expr::{Alias, Expr, ScalarFunction};
 use datafusion::logical_expr::expr_rewriter::FunctionRewrite;
 use datafusion::logical_expr::planner::{ExprPlanner, PlannerResult, RawBinaryExpr};
 use datafusion::logical_expr::sqlparser::ast::BinaryOperator;
@@ -23,8 +23,9 @@ impl FunctionRewrite for JsonFunctionRewriter {
 
     fn rewrite(&self, expr: Expr, _schema: &DFSchema, _config: &ConfigOptions) -> Result<Transformed<Expr>> {
         let transform = match &expr {
-            Expr::Cast(cast) => optimise_json_get_cast(cast),
-            Expr::ScalarFunction(func) => unnest_json_calls(func),
+            Expr::Cast(cast) => optimise_json_get_cast(cast.field.data_type(), &cast.expr),
+            Expr::TryCast(try_cast) => optimise_json_get_cast(try_cast.field.data_type(), &try_cast.expr),
+            Expr::ScalarFunction(func) => optimise_json_get_arrow_cast(func).or_else(|| unnest_json_calls(func)),
             _ => None,
         };
         Ok(transform.unwrap_or_else(|| Transformed::no(expr)))
@@ -33,18 +34,58 @@ impl FunctionRewrite for JsonFunctionRewriter {
 
 /// This replaces `get_json(foo, bar)::int` with `json_get_int(foo, bar)` so the JSON function can take care of
 /// extracting the right value type from JSON without the need to materialize the JSON union.
-fn optimise_json_get_cast(cast: &Cast) -> Option<Transformed<Expr>> {
-    let scalar_func = extract_scalar_function(&cast.expr)?;
+///
+/// `TRY_CAST` is folded the same way. The typed accessors already yield NULL for a value of another
+/// type instead of failing, which is exactly what `TRY_CAST` asks for.
+fn optimise_json_get_cast(cast_to: &DataType, cast_expr: &Expr) -> Option<Transformed<Expr>> {
+    let scalar_func = extract_scalar_function(cast_expr)?;
     if !is_json_get(scalar_func) {
         return None;
     }
-    let func = match cast.field.data_type() {
+    let func = match cast_to {
         DataType::Boolean => crate::json_get_bool::json_get_bool_udf(),
         DataType::Float64 | DataType::Float32 | DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => {
             crate::json_get_float::json_get_float_udf()
         }
         DataType::Int64 | DataType::Int32 => crate::json_get_int::json_get_int_udf(),
         DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8 => crate::json_get_str::json_get_str_udf(),
+        _ => return None,
+    };
+    Some(Transformed::yes(Expr::ScalarFunction(ScalarFunction {
+        func,
+        args: scalar_func.args.clone(),
+    })))
+}
+
+/// The same rewrite for `arrow_cast(json_get(foo, bar), 'Int64')` and its `arrow_try_cast` sibling.
+///
+/// These two are still scalar function calls when this rewriter runs. `DataFusion` lowers them to
+/// `Expr::Cast` / `Expr::TryCast` in `SimplifyExpressions`, an optimizer rule, whereas function
+/// rewrites are applied by `ApplyFunctionRewrites` at the start of the analyzer. The analyzer never
+/// runs again afterwards, so without this the JSON union is materialized only to be cast away.
+///
+/// Unlike `CAST`, `arrow_cast` names an exact Arrow type, so only the types an accessor returns
+/// exactly are folded here. `arrow_cast(x, 'Int32')` keeps its `Int32` output rather than widening
+/// to `json_get_int`'s `Int64`.
+fn optimise_json_get_arrow_cast(func: &ScalarFunction) -> Option<Transformed<Expr>> {
+    if !matches!(func.func.name(), "arrow_cast" | "arrow_try_cast") {
+        return None;
+    }
+    let [cast_expr, type_arg] = func.args.as_slice() else {
+        return None;
+    };
+    let Expr::Literal(ScalarValue::Utf8(Some(type_name)), _) = type_arg else {
+        return None;
+    };
+    let scalar_func = extract_scalar_function(cast_expr)?;
+    if !is_json_get(scalar_func) {
+        return None;
+    }
+    let func = match type_name.as_str() {
+        "Boolean" => crate::json_get_bool::json_get_bool_udf(),
+        "Float64" => crate::json_get_float::json_get_float_udf(),
+        "Int64" => crate::json_get_int::json_get_int_udf(),
+        "Utf8" => crate::json_get_str::json_get_str_udf(),
         _ => return None,
     };
     Some(Transformed::yes(Expr::ScalarFunction(ScalarFunction {
