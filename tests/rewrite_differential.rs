@@ -593,8 +593,7 @@ fn narrowing_cast_still_reaches_the_leaf_nodes() {
 
         let leaf_projection = plan
             .lines()
-            .filter(|line| line.trim_start().starts_with("Projection:"))
-            .next_back()
+            .rfind(|line| line.trim_start().starts_with("Projection:"))
             .unwrap_or_default();
         assert!(
             leaf_projection.contains(&format!("{}(t.j", target.accessor)),
