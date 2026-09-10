@@ -575,6 +575,35 @@ fn narrowing_cast_still_avoids_the_union() {
     );
 }
 
+/// Keeping the cast must not cost the accessor its trip to the leaf nodes.
+///
+/// `JsonGet`'s `placement` moves a `json_get` over a column with literal path arguments towards
+/// the leaves, which is where the work wants to happen for a filter. A cast sitting on top of the
+/// accessor is exactly the sort of thing that could strand it higher up the plan, so pin it.
+#[test]
+fn narrowing_cast_still_reaches_the_leaf_nodes() {
+    let rt = runtime();
+    let ctx = create_context().unwrap();
+    set_doc(&ctx, r#"{"a": 42}"#);
+
+    for target in TARGETS.iter().filter(|t| t.sql_cast != Fold::None) {
+        let predicate = Spelling::Cast.apply(&format!("json_get({JSON_COLUMN}, 'a')"), *target);
+        let sql = format!("select {JSON_COLUMN} from {JSON_TABLE} where {predicate} is not null");
+        let plan = rt.block_on(logical_plan(&ctx, &sql));
+
+        let leaf_projection = plan
+            .lines()
+            .filter(|line| line.trim_start().starts_with("Projection:"))
+            .next_back()
+            .unwrap_or_default();
+        assert!(
+            leaf_projection.contains(&format!("{}(t.j", target.accessor)),
+            "accessor did not reach the leaf projection for {}\n{plan}",
+            target.sql
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------------------
 // the barrier, and why the naive differential does not work for casts
 // ---------------------------------------------------------------------------------------
