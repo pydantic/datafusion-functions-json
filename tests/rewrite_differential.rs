@@ -29,6 +29,11 @@
 //! i.e. "use the typed accessor, then apply the cast the user actually wrote". The
 //! right-hand side is not itself folded — the rewriter only folds casts over `json_get` — so
 //! it serves as the reference implementation. That is [`prop_fold_is_invisible`].
+//!
+//! That is also, literally, what the rewriter emits: it replaces the cast's *input*, and drops
+//! the cast only where the accessor already returns the type that was asked for. The tests keep
+//! both sides anyway, because the reference is built from the SQL rather than from the rewriter,
+//! so a change to which accessor a type maps to still shows up here.
 
 use std::sync::Arc;
 
@@ -50,11 +55,12 @@ use proptest::prelude::*;
 enum Fold {
     /// Left alone: the cast is applied to the JSON union.
     None,
-    /// Folded to the typed accessor, whose return type *is* the type that was asked for.
+    /// Folded to the typed accessor, whose return type *is* the type that was asked for, so
+    /// the cast is dropped entirely.
     Exact,
-    /// Folded to the typed accessor, whose return type is **not** the type that was asked
-    /// for. The expression silently changes type and the narrowing never happens.
-    Widening,
+    /// Folded to the typed accessor, which returns a wider type, so the cast to the type that
+    /// was asked for is kept on top of it. The union is still never materialized.
+    Narrowing,
 }
 
 /// A cast target: how it is spelled in SQL, the exact Arrow type `arrow_cast` names for it,
@@ -96,31 +102,31 @@ const TARGETS: &[Target] = &[
         sql: "varchar",
         arrow: "Utf8",
         accessor: "json_get_str",
-        sql_cast: Fold::Widening,
+        sql_cast: Fold::Narrowing,
         arrow_cast: Fold::Exact,
     },
-    // Narrowing targets: the type asked for is narrower than what the accessor returns. The
-    // `CAST` table folds them anyway; the `arrow_*` handler deliberately does not.
+    // Narrowing targets: the type asked for is narrower than what the accessor returns, so the
+    // fold keeps the cast on top of the accessor.
     Target {
         sql: "int",
         arrow: "Int32",
         accessor: "json_get_int",
-        sql_cast: Fold::Widening,
-        arrow_cast: Fold::None,
+        sql_cast: Fold::Narrowing,
+        arrow_cast: Fold::Narrowing,
     },
     Target {
         sql: "real",
         arrow: "Float32",
         accessor: "json_get_float",
-        sql_cast: Fold::Widening,
-        arrow_cast: Fold::None,
+        sql_cast: Fold::Narrowing,
+        arrow_cast: Fold::Narrowing,
     },
     Target {
         sql: "decimal(10,2)",
         arrow: "Decimal128(10, 2)",
         accessor: "json_get_float",
-        sql_cast: Fold::Widening,
-        arrow_cast: Fold::None,
+        sql_cast: Fold::Narrowing,
+        arrow_cast: Fold::Narrowing,
     },
     // A type neither path has an accessor for, so neither folds it.
     Target {
@@ -376,12 +382,13 @@ fn doc() -> impl Strategy<Value = Doc> {
     })
 }
 
-/// A `(spelling, target)` pair whose fold is type-exact, so the fold must be invisible.
-fn exact_cast() -> impl Strategy<Value = (Spelling, Target)> {
+/// A `(spelling, target)` pair the rewriter folds, exactly or with a cast kept on top. Either
+/// way the fold has to be invisible.
+fn folding_cast() -> impl Strategy<Value = (Spelling, Target)> {
     let pairs: Vec<(Spelling, Target)> = SPELLINGS
         .iter()
         .flat_map(|&s| TARGETS.iter().map(move |&t| (s, t)))
-        .filter(|&(s, t)| s.fold(t) == Fold::Exact)
+        .filter(|&(s, t)| s.fold(t) != Fold::None)
         .collect();
     prop::sample::select(pairs)
 }
@@ -390,14 +397,15 @@ fn exact_cast() -> impl Strategy<Value = (Spelling, Target)> {
 // properties
 // ---------------------------------------------------------------------------------------
 
-/// Folding a type-exact cast must be indistinguishable from applying that same cast to the
-/// typed accessor.
+/// Folding must be indistinguishable from applying the same cast to the typed accessor —
+/// which is exactly what the rewriter now emits for a narrowing cast, and what the exact case
+/// simplifies down to.
 #[test]
 fn prop_fold_is_invisible() {
     let rt = runtime();
     let ctx = create_context().unwrap();
 
-    proptest!(|(doc in doc(), (spelling, target) in exact_cast())| {
+    proptest!(|(doc in doc(), (spelling, target) in folding_cast())| {
         set_doc(&ctx, &doc.json);
         let folded = select(&spelling.apply(&doc.json_get(), target));
         let reference = select(&spelling.apply(&doc.accessor(target.accessor), target));
@@ -457,9 +465,8 @@ fn prop_unnest_is_invisible() {
 // plan shape: which spellings fold
 // ---------------------------------------------------------------------------------------
 
-/// Every spelling of a cast a user might reach for folds to the same accessor — that is what
-/// PR #127 added — except `arrow_cast`/`arrow_try_cast` of a type no accessor returns
-/// exactly, which are deliberately left alone.
+/// Every spelling of a cast a user might reach for folds to the same accessor, and the plan
+/// keeps the cast exactly where the accessor's type is not the one that was asked for.
 #[test]
 fn every_cast_spelling_folds_as_documented() {
     let rt = runtime();
@@ -474,97 +481,98 @@ fn every_cast_spelling_folds_as_documented() {
         for &spelling in SPELLINGS {
             let sql = select(&spelling.apply(&doc.json_get(), target));
             let plan = rt.block_on(logical_plan(&ctx, &sql));
-            let folded = plan.contains(target.accessor);
-            let expected = spelling.fold(target) != Fold::None;
+            let fold = spelling.fold(target);
+
             assert_eq!(
-                folded, expected,
-                "expected folded={expected} for {spelling:?} / {}\n{plan}",
+                plan.contains(target.accessor),
+                fold != Fold::None,
+                "expected fold={fold:?} for {spelling:?} / {}\n{plan}",
                 target.sql
             );
-            if folded {
-                assert!(
-                    !plan.contains("json_get(t."),
-                    "fold left the union accessor behind for {spelling:?} / {}\n{plan}",
-                    target.sql
-                );
+            if fold == Fold::None {
+                continue;
             }
+            assert!(
+                !plan.contains("json_get(t."),
+                "fold left the union accessor behind for {spelling:?} / {}\n{plan}",
+                target.sql
+            );
+            // "CAST(json_get" also matches "TRY_CAST(json_get"
+            assert_eq!(
+                plan.contains(&format!("CAST({}(t.", target.accessor)),
+                fold == Fold::Narrowing,
+                "expected fold={fold:?} for {spelling:?} / {}\n{plan}",
+                target.sql
+            );
         }
     }
 }
 
 // ---------------------------------------------------------------------------------------
-// characterization: what folding a narrowing cast currently does
+// narrowing casts
 // ---------------------------------------------------------------------------------------
 
-/// The `CAST`/`TRY_CAST` path folds *every* type in its table down to the bare accessor,
-/// including types the accessor does not return. The result is that the expression's type is
-/// not the type the user asked for, and the narrowing the cast promised never happens.
-///
-/// This test pins the current behaviour rather than asserting the desired behaviour, so that
-/// it stays green while the divergence is open. **If this test starts failing because the
-/// fold became type-preserving, delete it** — [`prop_fold_is_invisible`] covers the fixed
-/// behaviour once these targets' `sql_cast` becomes `Fold::Exact`.
-///
-/// The fix that makes all of this go away is to keep the cast the user wrote and fold only
-/// its input, `CAST(json_get_int(x, 'k') AS Int32)` instead of `json_get_int(x, 'k')`. That
-/// keeps the whole point of the rewrite — the union is never materialized — while leaving
-/// the declared type and the narrowing intact, and `SimplifyExpressions` drops the cast
-/// where it is a no-op.
+/// Folding a cast whose type no accessor returns exactly still yields that type, and still
+/// narrows. Keeping the cast on top of the accessor is what buys this; folding to the bare
+/// accessor would hand back the accessor's wider type and skip the narrowing entirely.
 #[test]
-fn narrowing_cast_fold_is_not_type_preserving() {
+fn narrowing_cast_preserves_type_and_narrows() {
     let rt = runtime();
     let ctx = create_context().unwrap();
 
-    // (json value, sql type, folded outcome, what the same cast over the typed accessor gives)
+    // (json value, sql type, CAST outcome, TRY_CAST outcome)
     let cases = [
-        // the type of the expression is the accessor's, not the one the user asked for
-        ("42", "int", "Int64=42", "Int32=42"),
-        ("42", "real", "Float64=42.0", "Float32=42.0"),
-        ("42", "decimal(10,2)", "Float64=42.0", "Decimal128(10, 2)=42.00"),
-        (r#""abc""#, "varchar", "Utf8=abc", "Utf8View=abc"),
-        // and the narrowing the cast promised never happens
-        ("3000000000", "int", "Int64=3000000000", "ERROR"),
-        ("9223372036854775807", "int", "Int64=9223372036854775807", "ERROR"),
-        ("3000000000", "decimal(10,2)", "Float64=3000000000.0", "ERROR"),
+        ("42", "int", "Int32=42", "Int32=42"),
+        ("42", "real", "Float32=42.0", "Float32=42.0"),
+        (
+            "42",
+            "decimal(10,2)",
+            "Decimal128(10, 2)=42.00",
+            "Decimal128(10, 2)=42.00",
+        ),
+        (r#""abc""#, "varchar", "Utf8View=abc", "Utf8View=abc"),
+        // out of the target type's range: CAST fails, TRY_CAST yields NULL
+        ("3000000000", "int", "ERROR", "Int32=NULL"),
+        ("9223372036854775807", "int", "ERROR", "Int32=NULL"),
+        ("3000000000", "decimal(10,2)", "ERROR", "Decimal128(10, 2)=NULL"),
     ];
 
-    for (value, sql_type, want_folded, want_reference) in cases {
+    for (value, sql_type, want_cast, want_try_cast) in cases {
         let target = TARGETS.iter().find(|t| t.sql == sql_type).unwrap();
         let doc = Doc {
             json: format!(r#"{{"a": {value}}}"#),
             path: vec!["a".to_string()],
         };
         set_doc(&ctx, &doc.json);
-        let folded = select(&Spelling::Cast.apply(&doc.json_get(), *target));
-        let reference = select(&Spelling::Cast.apply(&doc.accessor(target.accessor), *target));
 
-        assert_eq!(rt.block_on(outcome(&ctx, &folded)).to_string(), want_folded, "{folded}");
-        assert_eq!(
-            rt.block_on(outcome(&ctx, &reference)).to_string(),
-            want_reference,
-            "{reference}"
-        );
+        for (spelling, want) in [(Spelling::Cast, want_cast), (Spelling::TryCast, want_try_cast)] {
+            let sql = select(&spelling.apply(&doc.json_get(), *target));
+            assert_eq!(rt.block_on(outcome(&ctx, &sql)).to_string(), want, "{sql}");
+        }
     }
 }
 
-/// `TRY_CAST`, which PR #127 routes through the same type table, inherits the same gap: it
-/// returns a value where the cast it stands for would have returned NULL.
+/// The narrowing fold is not just correct, it is the whole point: the JSON union never gets
+/// materialized, the plan reads the value straight out with the typed accessor and casts that.
 #[test]
-fn narrowing_try_cast_fold_returns_value_instead_of_null() {
+fn narrowing_cast_still_avoids_the_union() {
     let rt = runtime();
     let ctx = create_context().unwrap();
-    let target = TARGETS.iter().find(|t| t.sql == "int").unwrap();
+    set_doc(&ctx, r#"{"a": 42}"#);
     let doc = Doc {
-        json: r#"{"a": 3000000000}"#.to_string(),
+        json: r#"{"a": 42}"#.to_string(),
         path: vec!["a".to_string()],
     };
+    let target = TARGETS.iter().find(|t| t.sql == "int").unwrap();
 
-    set_doc(&ctx, &doc.json);
-    let folded = select(&Spelling::TryCast.apply(&doc.json_get(), *target));
-    let reference = select(&Spelling::TryCast.apply(&doc.accessor(target.accessor), *target));
-
-    assert_eq!(rt.block_on(outcome(&ctx, &folded)).to_string(), "Int64=3000000000");
-    assert_eq!(rt.block_on(outcome(&ctx, &reference)).to_string(), "Int32=NULL");
+    let plan = rt.block_on(logical_plan(
+        &ctx,
+        &select(&Spelling::Cast.apply(&doc.json_get(), *target)),
+    ));
+    assert!(
+        plan.contains("CAST(json_get_int(t.j, Utf8(\"a\")) AS Int32)"),
+        "unexpected plan:\n{plan}"
+    );
 }
 
 // ---------------------------------------------------------------------------------------
